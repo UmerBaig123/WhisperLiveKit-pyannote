@@ -5,6 +5,7 @@ import numpy as np
 import logging
 import time
 from typing import List
+import torch
 
 from pyannote.audio.pipelines.speaker_diarization import SpeakerDiarization
 from whisperlivekit.timed_objects import SpeakerSegment
@@ -120,13 +121,18 @@ class DiarizationProcessor:
         
         try:
             # Convert to torch tensor and create audio dict for pyannote
-            import torch
-            
             # Ensure audio is the right shape (1, num_samples) for mono audio
             if audio.ndim == 1:
                 waveform = torch.from_numpy(audio).unsqueeze(0).float()
-            else:
+            elif audio.ndim == 2:
+                # Handle multi-channel audio - convert to mono by averaging channels
+                if audio.shape[0] > 1:
+                    audio = np.mean(audio, axis=0)
                 waveform = torch.from_numpy(audio).float()
+                if waveform.ndim == 1:
+                    waveform = waveform.unsqueeze(0)
+            else:
+                raise ValueError(f"Unexpected audio shape: {audio.shape}. Expected 1D or 2D array.")
             
             # Create audio dict that pyannote expects
             audio_dict = {
