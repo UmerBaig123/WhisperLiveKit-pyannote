@@ -4,10 +4,7 @@ import threading
 import numpy as np
 import logging
 import time
-import tempfile
-import soundfile as sf
 from typing import List
-from pathlib import Path
 
 from pyannote.audio.pipelines.speaker_diarization import SpeakerDiarization
 from whisperlivekit.timed_objects import SpeakerSegment
@@ -122,13 +119,23 @@ class DiarizationProcessor:
         segments = []
         
         try:
-            # Create a temporary WAV file for pyannote
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
-                tmp_path = tmp_file.name
-                sf.write(tmp_path, audio, self.sample_rate)
+            # Convert to torch tensor and create audio dict for pyannote
+            import torch
+            
+            # Ensure audio is the right shape (1, num_samples) for mono audio
+            if audio.ndim == 1:
+                waveform = torch.from_numpy(audio).unsqueeze(0).float()
+            else:
+                waveform = torch.from_numpy(audio).float()
+            
+            # Create audio dict that pyannote expects
+            audio_dict = {
+                "waveform": waveform,
+                "sample_rate": self.sample_rate
+            }
             
             # Run diarization
-            diarization = self.pipeline(tmp_path)
+            diarization = self.pipeline(audio_dict)
             
             # Convert pyannote output to SpeakerSegment objects
             for turn, _, speaker in diarization.itertracks(yield_label=True):
@@ -139,9 +146,6 @@ class DiarizationProcessor:
                         start=turn.start + self.global_time_offset,
                         end=turn.end + self.global_time_offset
                     ))
-            
-            # Clean up temp file
-            Path(tmp_path).unlink(missing_ok=True)
             
             logger.debug(f"Diarization found {len(segments)} new segments")
             
