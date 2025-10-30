@@ -20,7 +20,7 @@
 - [SimulStreaming](https://github.com/ufal/SimulStreaming) (SOTA 2025) - AlignAttポリシーによる超低遅延文字起こし
 - [WhisperStreaming](https://github.com/ufal/whisper_streaming) (SOTA 2023) - LocalAgreementポリシーによる低遅延文字起こし
 - [Streaming Sortformer](https://arxiv.org/abs/2507.18446) (SOTA 2025) - 高度なリアルタイム話者ダイアライゼーション
-- [Diart](https://github.com/juanmc2005/diart) (SOTA 2021) - リアルタイム話者ダイアライゼーション
+- [pyannote.audio](https://github.com/pyannote/pyannote-audio) (SOTA 2024) - リアルタイム話者ダイアライゼーション
 - [Silero VAD](https://github.com/snakers4/silero-vad) (2024) - エンタープライズグレードの音声区間検出
 
 > **なぜ各音声バッチで単純なWhisperモデルを実行しないのか？** Whisperは完全な発話向けに設計されており、リアルタイムのチャンク向けではありません。小さなセグメントを処理するとコンテキストが失われ、単語が音節の途中で途切れ、質の悪い文字起こしになります。WhisperLiveKitは、インテリジェントなバッファリングとインクリメンタルな処理のために、最先端の同時音声研究を利用しています。
@@ -62,7 +62,7 @@ pip install whisperlivekit
 | オプション | `pip install` |
 |-----------|-------------|
 | **Sortformerによる話者ダイアライゼーション** | `git+https://github.com/NVIDIA/NeMo.git@main#egg=nemo_toolkit[asr]` |
-| Diartによる話者ダイアライゼーション | `diart` |
+| pyannote.audioによる話者ダイアライゼーション | `pyannote-audio` |
 | オリジナルのWhisperバックエンド | `whisper` |
 | タイムスタンプ改善バックエンド | `whisper-timestamped` |
 | Apple Silicon最適化バックエンド | `mlx-whisper` |
@@ -175,16 +175,16 @@ async def websocket_endpoint(websocket: WebSocket):
 | ダイアライゼーションオプション | 説明 | デフォルト |
 |-----------|-------------|---------|
 | `--diarization` | 話者識別を有効化 | `False` |
-| `--diarization-backend` | `diart`または`sortformer` | `sortformer` |
-| `--segmentation-model` | DiartセグメンテーションモデルのHugging FaceモデルID。[利用可能なモデル](https://github.com/juanmc2005/diart/tree/main?tab=readme-ov-file#pre-trained-models) | `pyannote/segmentation-3.0` |
-| `--embedding-model` | Diart埋め込みモデルのHugging FaceモデルID。[利用可能なモデル](https://github.com/juanmc2005/diart/tree/main?tab=readme-ov-file#pre-trained-models) | `speechbrain/spkrec-ecapa-voxceleb` |
+| `--diarization-backend` | `pyannote`または`sortformer` | `sortformer` |
+| `--segmentation-model` | セグメンテーションモデルのHugging FaceモデルID（非推奨、代わりに`--diarization-pipeline`を使用）。[利用可能なモデル](https://huggingface.co/pyannote) | `pyannote/segmentation-3.0` |
+| `--embedding-model` | 埋め込みモデルのHugging FaceモデルID（非推奨、代わりに`--diarization-pipeline`を使用）。[利用可能なモデル](https://huggingface.co/pyannote) | `pyannote/embedding` |
+| `--diarization-pipeline` | 完全なダイアライゼーションパイプラインのHugging FaceモデルID（推奨）。[利用可能なパイプライン](https://huggingface.co/pyannote) | `pyannote/speaker-diarization-3.1` |
 
 
-> Diartを使用したダイアライゼーションには、pyannote.audioモデルへのアクセスが必要です：
-> 1. `pyannote/segmentation`モデルの[ユーザー条件に同意](https://huggingface.co/pyannote/segmentation)
-> 2. `pyannote/segmentation-3.0`モデルの[ユーザー条件に同意](https://huggingface.co/pyannote/segmentation-3.0)
-> 3. `pyannote/embedding`モデルの[ユーザー条件に同意](https://huggingface.co/pyannote/embedding)
->4. HuggingFaceでログイン: `huggingface-cli login`
+> pyannote.audioを使用したダイアライゼーションには、ユーザー条件への同意が必要です：
+> 1. [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)モデルのユーザー条件に同意
+> 2. [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)パイプラインのユーザー条件に同意
+> 3. HuggingFaceでログイン: `huggingface-cli login`
 
 ### 🚀 デプロイガイド
 

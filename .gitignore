@@ -125,3 +125,7 @@ launch.json
 test/*
 nllb-200-distilled-600M-ctranslate2/*
 *.mp3
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore
