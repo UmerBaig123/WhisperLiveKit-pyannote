@@ -62,8 +62,15 @@ def parse_args():
         "--diarization-backend",
         type=str,
         default="sortformer",
-        choices=["sortformer", "diart"],
-        help="The diarization backend to use.",
+        choices=["sortformer", "pyannote", "diart"],
+        help="The diarization backend to use. 'pyannote' uses pyannote.audio pipeline (recommended), 'diart' is deprecated and maps to 'pyannote'.",
+    )
+    
+    parser.add_argument(
+        "--diarization-pipeline",
+        type=str,
+        default="pyannote/speaker-diarization-3.1",
+        help="Hugging Face model ID for complete diarization pipeline (only used with pyannote backend).",
     )
 
     parser.add_argument(

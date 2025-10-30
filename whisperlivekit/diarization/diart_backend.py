@@ -4,58 +4,152 @@ import threading
 import numpy as np
 import logging
 import time
-from queue import SimpleQueue, Empty
+import tempfile
+import soundfile as sf
+from typing import List
+from pathlib import Path
 
-from diart import SpeakerDiarization, SpeakerDiarizationConfig
-from diart.inference import StreamingInference
-from diart.sources import AudioSource
+from pyannote.audio.pipelines.speaker_diarization import SpeakerDiarization
 from whisperlivekit.timed_objects import SpeakerSegment
-from diart.sources import MicrophoneAudioSource
-from rx.core import Observer
-from typing import Tuple, Any, List
-from pyannote.core import Annotation
-import diart.models as m
 
 logger = logging.getLogger(__name__)
 
 def extract_number(s: str) -> int:
+    """Extract number from speaker label (e.g., 'SPEAKER_00' -> 0)"""
     m = re.search(r'\d+', s)
-    return int(m.group()) if m else None
+    return int(m.group()) if m else 0
 
-class DiarizationObserver(Observer):
-    """Observer that logs all data emitted by the diarization pipeline and stores speaker segments."""
+
+class DiarizationProcessor:
+    """Processes audio chunks for diarization using pyannote.audio pipeline."""
     
-    def __init__(self):
+    def __init__(self, pipeline: SpeakerDiarization, sample_rate: int = 16000, processing_interval: float = 2.0):
+        """
+        Initialize the diarization processor.
+        
+        Args:
+            pipeline: pyannote.audio SpeakerDiarization pipeline
+            sample_rate: Audio sample rate in Hz
+            processing_interval: How often to run diarization (in seconds)
+        """
+        self.pipeline = pipeline
+        self.sample_rate = sample_rate
+        self.processing_interval = processing_interval
+        
         self.speaker_segments = []
-        self.processed_time = 0
         self.segment_lock = threading.Lock()
         self.global_time_offset = 0.0
+        
+        # Audio buffer
+        self.audio_buffer = np.array([], dtype=np.float32)
+        self.buffer_lock = threading.Lock()
+        self.total_audio_duration = 0.0
+        self.last_processed_duration = 0.0
+        
+        # Processing control
+        self._running = False
+        self._processing_thread = None
+        
+    def start(self):
+        """Start the background processing thread."""
+        if not self._running:
+            self._running = True
+            self._processing_thread = threading.Thread(target=self._process_loop, daemon=True)
+            self._processing_thread.start()
+            logger.info("Diarization processor started")
     
-    def on_next(self, value: Tuple[Annotation, Any]):
-        annotation, audio = value
-        
-        logger.debug("\n--- New Diarization Result ---")
-        
-        duration = audio.extent.end - audio.extent.start
-        logger.debug(f"Audio segment: {audio.extent.start:.2f}s - {audio.extent.end:.2f}s (duration: {duration:.2f}s)")
-        logger.debug(f"Audio shape: {audio.data.shape}")
-        
-        with self.segment_lock:
-            if audio.extent.end > self.processed_time:
-                self.processed_time = audio.extent.end            
-            if annotation and len(annotation._labels) > 0:
-                logger.debug("\nSpeaker segments:")
-                for speaker, label in annotation._labels.items():
-                    for start, end in zip(label.segments_boundaries_[:-1], label.segments_boundaries_[1:]):
-                        print(f"  {speaker}: {start:.2f}s-{end:.2f}s")
-                        self.speaker_segments.append(SpeakerSegment(
-                            speaker=speaker,
-                            start=start + self.global_time_offset,
-                            end=end + self.global_time_offset
-                        ))
-            else:
-                logger.debug("\nNo speakers detected in this segment")
+    def stop(self):
+        """Stop the background processing thread."""
+        self._running = False
+        if self._processing_thread:
+            self._processing_thread.join(timeout=2.0)
+        logger.info("Diarization processor stopped")
+    
+    def add_audio(self, audio_chunk: np.ndarray):
+        """Add audio chunk to the buffer."""
+        with self.buffer_lock:
+            if audio_chunk.ndim > 1:
+                audio_chunk = audio_chunk.flatten()
+            self.audio_buffer = np.concatenate([self.audio_buffer, audio_chunk])
+            self.total_audio_duration = len(self.audio_buffer) / self.sample_rate
+    
+    def _process_loop(self):
+        """Background processing loop."""
+        while self._running:
+            time.sleep(self.processing_interval)
+            
+            with self.buffer_lock:
+                # Check if we have enough new audio to process
+                new_audio_duration = self.total_audio_duration - self.last_processed_duration
                 
+                if new_audio_duration < self.processing_interval * 0.5:
+                    continue
+                
+                # Get audio to process
+                audio_to_process = self.audio_buffer.copy()
+                processing_duration = self.total_audio_duration
+            
+            if len(audio_to_process) == 0:
+                continue
+                
+            try:
+                # Run diarization on accumulated audio
+                segments = self._run_diarization(audio_to_process, processing_duration)
+                
+                with self.segment_lock:
+                    # Update segments - only keep new segments beyond what we've processed
+                    self.speaker_segments = [
+                        seg for seg in self.speaker_segments 
+                        if seg.start < self.last_processed_duration + self.global_time_offset
+                    ] + segments
+                
+                self.last_processed_duration = processing_duration
+                
+            except Exception as e:
+                logger.error(f"Error in diarization processing: {e}")
+    
+    def _run_diarization(self, audio: np.ndarray, duration: float) -> List[SpeakerSegment]:
+        """
+        Run diarization on audio buffer.
+        
+        Args:
+            audio: Audio data as numpy array
+            duration: Duration of audio in seconds
+            
+        Returns:
+            List of SpeakerSegment objects
+        """
+        segments = []
+        
+        try:
+            # Create a temporary WAV file for pyannote
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
+                tmp_path = tmp_file.name
+                sf.write(tmp_path, audio, self.sample_rate)
+            
+            # Run diarization
+            diarization = self.pipeline(tmp_path)
+            
+            # Convert pyannote output to SpeakerSegment objects
+            for turn, _, speaker in diarization.itertracks(yield_label=True):
+                # Only include segments from new audio
+                if turn.start >= self.last_processed_duration:
+                    segments.append(SpeakerSegment(
+                        speaker=speaker,
+                        start=turn.start + self.global_time_offset,
+                        end=turn.end + self.global_time_offset
+                    ))
+            
+            # Clean up temp file
+            Path(tmp_path).unlink(missing_ok=True)
+            
+            logger.debug(f"Diarization found {len(segments)} new segments")
+            
+        except Exception as e:
+            logger.error(f"Error running diarization: {e}")
+        
+        return segments
+    
     def get_segments(self) -> List[SpeakerSegment]:
         """Get a copy of the current speaker segments."""
         with self.segment_lock:
@@ -64,167 +158,110 @@ class DiarizationObserver(Observer):
     def clear_old_segments(self, older_than: float = 30.0):
         """Clear segments older than the specified time."""
         with self.segment_lock:
-            current_time = self.processed_time
+            current_time = self.total_audio_duration + self.global_time_offset
             self.speaker_segments = [
                 segment for segment in self.speaker_segments 
                 if current_time - segment.end < older_than
             ]
     
-    def on_error(self, error):
-        """Handle an error in the stream."""
-        logger.debug(f"Error in diarization stream: {error}")
-        
-    def on_completed(self):
-        """Handle the completion of the stream."""
-        logger.debug("Diarization stream completed")
+    def insert_silence(self, silence_duration: float):
+        """Adjust global time offset for silence periods."""
+        self.global_time_offset += silence_duration
+        logger.debug(f"Inserted silence of {silence_duration:.2f}s, new offset: {self.global_time_offset:.2f}s")
 
 
-class WebSocketAudioSource(AudioSource):
-    """
-    Buffers incoming audio and releases it in fixed-size chunks at regular intervals.
-    """
-    def __init__(self, uri: str = "websocket", sample_rate: int = 16000, block_duration: float = 0.5):
-        super().__init__(uri, sample_rate)
-        self.block_duration = block_duration
-        self.block_size = int(np.rint(block_duration * sample_rate))
-        self._queue = SimpleQueue()
-        self._buffer = np.array([], dtype=np.float32)
-        self._buffer_lock = threading.Lock()
-        self._closed = False
-        self._close_event = threading.Event()
-        self._processing_thread = None
-        self._last_chunk_time = time.time()
-
-    def read(self):
-        """Start processing buffered audio and emit fixed-size chunks."""
-        self._processing_thread = threading.Thread(target=self._process_chunks)
-        self._processing_thread.daemon = True
-        self._processing_thread.start()
-        
-        self._close_event.wait()
-        if self._processing_thread:
-            self._processing_thread.join(timeout=2.0)
-
-    def _process_chunks(self):
-        """Process audio from queue and emit fixed-size chunks at regular intervals."""
-        while not self._closed:
-            try:
-                audio_chunk = self._queue.get(timeout=0.1)
-                
-                with self._buffer_lock:
-                    self._buffer = np.concatenate([self._buffer, audio_chunk])
-                    
-                    while len(self._buffer) >= self.block_size:
-                        chunk = self._buffer[:self.block_size]
-                        self._buffer = self._buffer[self.block_size:]
-                        
-                        current_time = time.time()
-                        time_since_last = current_time - self._last_chunk_time
-                        if time_since_last < self.block_duration:
-                            time.sleep(self.block_duration - time_since_last)
-                        
-                        chunk_reshaped = chunk.reshape(1, -1)
-                        self.stream.on_next(chunk_reshaped)
-                        self._last_chunk_time = time.time()
-                        
-            except Empty:
-                with self._buffer_lock:
-                    if len(self._buffer) > 0 and time.time() - self._last_chunk_time > self.block_duration:
-                        padded_chunk = np.zeros(self.block_size, dtype=np.float32)
-                        padded_chunk[:len(self._buffer)] = self._buffer
-                        self._buffer = np.array([], dtype=np.float32)
-                        
-                        chunk_reshaped = padded_chunk.reshape(1, -1)
-                        self.stream.on_next(chunk_reshaped)
-                        self._last_chunk_time = time.time()
-            except Exception as e:
-                logger.error(f"Error in audio processing thread: {e}")
-                self.stream.on_error(e)
-                break
-        
-        with self._buffer_lock:
-            if len(self._buffer) > 0:
-                padded_chunk = np.zeros(self.block_size, dtype=np.float32)
-                padded_chunk[:len(self._buffer)] = self._buffer
-                chunk_reshaped = padded_chunk.reshape(1, -1)
-                self.stream.on_next(chunk_reshaped)
-        
-        self.stream.on_completed()
-
-    def close(self):
-        if not self._closed:
-            self._closed = True
-            self._close_event.set()
-
-    def push_audio(self, chunk: np.ndarray):
-        """Add audio chunk to the processing queue."""
-        if not self._closed:
-            if chunk.ndim > 1:
-                chunk = chunk.flatten()
-            self._queue.put(chunk)
-            logger.debug(f'Added chunk to queue with {len(chunk)} samples')
 
 
 class DiartDiarization:
-    def __init__(self, sample_rate: int = 16000, config : SpeakerDiarizationConfig = None, use_microphone: bool = False, block_duration: float = 1.5, segmentation_model_name: str = "pyannote/segmentation-3.0", embedding_model_name: str = "pyannote/embedding"):
-        segmentation_model = m.SegmentationModel.from_pretrained(segmentation_model_name)
-        embedding_model = m.EmbeddingModel.from_pretrained(embedding_model_name)
+    """
+    Diarization backend using pyannote.audio SpeakerDiarization pipeline.
+    
+    This class maintains compatibility with the original diart-based interface
+    while using the newer pyannote.audio API underneath.
+    """
+    
+    def __init__(
+        self, 
+        sample_rate: int = 16000, 
+        config=None,  # Kept for compatibility but not used
+        use_microphone: bool = False,  # Not supported with pyannote approach
+        block_duration: float = 1.5,
+        segmentation_model_name: str = "pyannote/segmentation-3.0",
+        embedding_model_name: str = "pyannote/embedding",
+        pipeline_name: str = "pyannote/speaker-diarization-3.1"
+    ):
+        """
+        Initialize diarization using pyannote.audio pipeline.
         
-        if config is None:
-            config = SpeakerDiarizationConfig(
-                segmentation=segmentation_model,
-                embedding=embedding_model,
-            )
-        
-        self.pipeline = SpeakerDiarization(config=config)        
-        self.observer = DiarizationObserver()
-        self.lag_diart = None
-        
+        Args:
+            sample_rate: Audio sample rate (should be 16000)
+            config: Ignored, kept for compatibility
+            use_microphone: Not supported with pyannote approach
+            block_duration: How often to process accumulated audio
+            segmentation_model_name: Ignored (pipeline uses its own)
+            embedding_model_name: Ignored (pipeline uses its own)
+            pipeline_name: HuggingFace model ID for the diarization pipeline
+        """
         if use_microphone:
-            self.source = MicrophoneAudioSource(block_duration=block_duration)
-            self.custom_source = None
-        else:
-            self.custom_source = WebSocketAudioSource(
-                uri="websocket_source", 
-                sample_rate=sample_rate,
-                block_duration=block_duration
-            )
-            self.source = self.custom_source
-            
-        self.inference = StreamingInference(
+            logger.warning("Microphone input not supported with pyannote backend, using buffer mode")
+        
+        self.sample_rate = sample_rate
+        self.lag_diart = None  # Kept for compatibility with assign_speakers_to_tokens
+        
+        # Load the pyannote.audio pipeline
+        logger.info(f"Loading pyannote.audio pipeline: {pipeline_name}")
+        try:
+            self.pipeline = SpeakerDiarization.from_pretrained(pipeline_name)
+            logger.info("Pipeline loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load pipeline: {e}")
+            logger.error("Make sure you have accepted the user conditions for pyannote models:")
+            logger.error("1. https://huggingface.co/pyannote/segmentation-3.0")
+            logger.error("2. https://huggingface.co/pyannote/speaker-diarization-3.1")
+            logger.error("And run: huggingface-cli login")
+            raise
+        
+        # Create processor
+        self.processor = DiarizationProcessor(
             pipeline=self.pipeline,
-            source=self.source,
-            do_plot=False,
-            show_progress=False,
+            sample_rate=sample_rate,
+            processing_interval=block_duration
         )
-        self.inference.attach_observers(self.observer)
-        asyncio.get_event_loop().run_in_executor(None, self.inference)
-
-    def insert_silence(self, silence_duration):
-        self.observer.global_time_offset += silence_duration
-
+        
+        # Start processing
+        self.processor.start()
+        
+        logger.info("DiartDiarization initialized with pyannote.audio backend")
+    
+    def insert_silence(self, silence_duration: float):
+        """Insert silence period by adjusting the global time offset."""
+        self.processor.insert_silence(silence_duration)
+    
     async def diarize(self, pcm_array: np.ndarray):
         """
         Process audio data for diarization.
-        Only used when working with WebSocketAudioSource.
+        
+        Args:
+            pcm_array: Audio data as numpy array
         """
-        if self.custom_source:
-            self.custom_source.push_audio(pcm_array)            
-        # self.observer.clear_old_segments()        
-
+        self.processor.add_audio(pcm_array)
+    
     def close(self):
-        """Close the audio source."""
-        if self.custom_source:
-            self.custom_source.close()
-
-    def assign_speakers_to_tokens(self, tokens: list, use_punctuation_split: bool = False) -> float:
+        """Stop the diarization processor."""
+        self.processor.stop()
+    
+    def assign_speakers_to_tokens(self, tokens: list, use_punctuation_split: bool = False) -> list:
         """
         Assign speakers to tokens based on timing overlap with speaker segments.
-        Uses the segments collected by the observer.
         
-        If use_punctuation_split is True, uses punctuation marks to refine speaker boundaries.
+        Args:
+            tokens: List of tokens with timing information
+            use_punctuation_split: If True, uses punctuation marks to refine speaker boundaries
+            
+        Returns:
+            List of tokens with speaker assignments
         """
-        segments = self.observer.get_segments()
+        segments = self.processor.get_segments()
         
         # Debug logging
         logger.debug(f"assign_speakers_to_tokens called with {len(tokens)} tokens")
@@ -238,11 +275,16 @@ class DiartDiarization:
         if not use_punctuation_split:
             for token in tokens:
                 for segment in segments:
-                    if not (segment.end <= token.start + self.lag_diart or segment.start >= token.end + self.lag_diart):
-                        token.speaker = extract_number(segment.speaker) + 1
+                    lag = self.lag_diart if self.lag_diart else 0
+                    if not (segment.end <= token.start + lag or segment.start >= token.end + lag):
+                        # Extract speaker number from label (e.g., "SPEAKER_00" -> 0)
+                        speaker_num = extract_number(segment.speaker)
+                        token.speaker = speaker_num + 1
         else:
             tokens = add_speaker_to_tokens(segments, tokens)
+        
         return tokens
+
         
 def concatenate_speakers(segments):
     segments_concatenated = [{"speaker": 1, "begin": 0.0, "end": 0.0}]

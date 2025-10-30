@@ -121,16 +121,22 @@ class TranscriptionEngine:
                 )
 
         if self.args.diarization:
+            # Map legacy "diart" backend to "pyannote"
             if self.args.diarization_backend == "diart":
+                logger.warning("'diart' backend is deprecated. Using 'pyannote' instead.")
+                self.args.diarization_backend = "pyannote"
+            
+            if self.args.diarization_backend == "pyannote":
                 from whisperlivekit.diarization.diart_backend import DiartDiarization
-                diart_params = {
-                    "segmentation_model": "pyannote/segmentation-3.0",
-                    "embedding_model": "pyannote/embedding",
+                pyannote_params = {
+                    "segmentation_model_name": kwargs.get("segmentation_model", "pyannote/segmentation-3.0"),
+                    "embedding_model_name": kwargs.get("embedding_model", "pyannote/embedding"),
+                    "pipeline_name": kwargs.get("diarization_pipeline", "pyannote/speaker-diarization-3.1"),
                 }
-                diart_params = update_with_kwargs(diart_params, kwargs)
+                pyannote_params = update_with_kwargs(pyannote_params, kwargs)
                 self.diarization_model = DiartDiarization(
                     block_duration=self.args.min_chunk_size,
-                    **diart_params
+                    **pyannote_params
                 )
             elif self.args.diarization_backend == "sortformer":
                 from whisperlivekit.diarization.sortformer_backend import SortformerDiarization
@@ -161,11 +167,11 @@ def online_factory(args, asr):
   
   
 def online_diarization_factory(args, diarization_backend):
-    if args.diarization_backend == "diart":
+    if args.diarization_backend == "pyannote":
         online = diarization_backend
-        # Not the best here, since several user/instances will share the same backend, but diart is not SOTA anymore and sortformer is recommended
+        # Not the best here, since several user/instances will share the same backend, but this is the same approach as diart
     
-    if args.diarization_backend == "sortformer":
+    elif args.diarization_backend == "sortformer":
         from whisperlivekit.diarization.sortformer_backend import SortformerDiarizationOnline
         online = SortformerDiarizationOnline(shared_model=diarization_backend)
     return online
